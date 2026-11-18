@@ -1,0 +1,199 @@
+name: Build Kodi Lite for Android (.apk)
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_arch:
+        description: 'Android CPU architecture (aarch64-linux-android = 64-bit, arm-linux-androideabi = 32-bit)'
+        required: false
+        default: 'aarch64-linux-android'
+        type: choice
+        options:
+          - aarch64-linux-android
+          - arm-linux-androideabi
+      kodi_branch:
+        description: 'Kodi Git branch to build (used only if use_repo_source is false)'
+        required: false
+        default: 'master'
+      use_repo_source:
+        description: 'Build from this repository (true) or clone upstream xbmc/xbmc (false)'
+        required: false
+        default: 'false'
+
+jobs:
+  build-kodi-android-lite:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free up runner disk space (keep Android SDK)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h
+
+      - name: Set up JDK 17 (required by Gradle 8+)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake autopoint autotools-dev build-essential \
+            ca-certificates ccache cmake curl flex bison gawk gettext git \
+            gperf lib32stdc++6 lib32z1 lib32z1-dev libtool m4 make nasm \
+            ninja-build patch pkg-config python3 python3-dev python3-pil \
+            rsync swig tar texinfo unzip xz-utils yasm zip zlib1g-dev \
+            libcurl4-openssl-dev libssl-dev libbz2-dev liblzma-dev \
+            libxml2-dev libexpat1-dev libffi-dev libreadline-dev \
+            libncurses5-dev libsqlite3-dev
+
+      - name: Configure Android SDK, NDK r28c, and debug signing key
+        run: |
+          SDK_DIR="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --sdk_root="$SDK_DIR" --licenses || true
+          "$SDKMANAGER" --sdk_root="$SDK_DIR" \
+            "platform-tools" \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0" \
+            "ndk;28.2.13676358"
+          echo "KODI_ANDROID_SDK=$SDK_DIR" >> "$GITHUB_ENV"
+
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkey -keystore "$HOME/.android/debug.keystore" \
+              -v -alias androiddebugkey \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -keypass android -storepass android \
+              -keyalg RSA -keysize 2048 -validity 10000
+          fi
+
+      - name: Checkout repository (if building from local repo)
+        if: ${{ github.event.inputs.use_repo_source == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          path: kodi
+
+      - name: Clone Kodi source (if building from upstream xbmc/xbmc)
+        if: ${{ github.event.inputs.use_repo_source != 'true' }}
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.kodi_branch || 'master' }}" \
+            https://github.com/xbmc/xbmc.git kodi
+
+      - name: Inject lightweight Local/USB/Router/PC advancedsettings.xml
+        run: |
+          cat << 'EOF' > kodi/system/advancedsettings.xml
+          <advancedsettings version="1.0">
+            <!-- Lightweight texture/cache limits for fast mobile browsing -->
+            <imageres>720</imageres>
+            <fanartres>1080</fanartres>
+            <useddsfanart>false</useddsfanart>
+
+            <!-- Read local .nfo, poster, clearlogo, fanart from Phone, USB OTG, Router (SMB/FTP), or PC -->
+            <videolibrary>
+              <importwatchedstate>true</importwatchedstate>
+              <importresumepoint>true</importresumepoint>
+              <movieextraart>
+                <arttype>clearlogo</arttype>
+                <arttype>clearart</arttype>
+                <arttype>banner</arttype>
+                <arttype>landscape</arttype>
+                <arttype>discart</arttype>
+              </movieextraart>
+              <tvshowextraart>
+                <arttype>clearlogo</arttype>
+                <arttype>clearart</arttype>
+                <arttype>banner</arttype>
+                <arttype>landscape</arttype>
+              </tvshowextraart>
+            </videolibrary>
+
+            <network>
+              <disableipv6>true</disableipv6>
+            </network>
+            <splash>false</splash>
+            <loglevel>-1</loglevel>
+          </advancedsettings>
+          EOF
+
+      - name: Build Kodi unified dependencies for Android
+        working-directory: kodi/tools/depends
+        run: |
+          HOST_ARCH="${{ github.event.inputs.android_arch || 'aarch64-linux-android' }}"
+          ./bootstrap
+          ./configure \
+            --with-tarballs="$HOME/android-tools/xbmc-tarballs" \
+            --host="$HOST_ARCH" \
+            --with-sdk-path="$KODI_ANDROID_SDK" \
+            --with-ndk-path="$KODI_ANDROID_SDK/ndk/28.2.13676358" \
+            --prefix="$HOME/android-tools/xbmc-depends" \
+            --enable-debug=no
+          make -j"$(nproc)" || make -j1
+
+      - name: Configure stripped-down Kodi Lite CMake build for Android
+        working-directory: kodi
+        run: |
+          make -C tools/depends/target/cmakebuildsys \
+            BUILD_DIR="$PWD/build" \
+            CMAKE_EXTRA_ARGUMENTS="-DCMAKE_BUILD_TYPE=Release \
+              -DENABLE_SMBCLIENT=ON \
+              -DENABLE_UPNP=ON \
+              -DENABLE_AIRTUNES=OFF \
+              -DENABLE_OPTICAL=OFF \
+              -DENABLE_DVDCSS=OFF \
+              -DENABLE_TESTING=OFF \
+              -DENABLE_EVENTCLIENTS=OFF \
+              -DENABLE_MYSQLCLIENT=OFF \
+              -DENABLE_MARIADBCLIENT=OFF \
+              -DENABLE_MICROHTTPD=OFF \
+              -DENABLE_AVAHI=OFF \
+              -DENABLE_BLURAY=OFF \
+              -DENABLE_NFS=OFF \
+              -DENABLE_LCMS2=OFF"
+
+      - name: Compile Kodi Lite for Android
+        working-directory: kodi/build
+        run: |
+          make -j"$(nproc)"
+
+      - name: Strip unused add-ons and package .apk
+        working-directory: kodi/build
+        run: |
+          ADDONS_DIR="$PWD/addons"
+          rm -rf \
+            "$ADDONS_DIR/audioencoder.kodi.builtin.aac" \
+            "$ADDONS_DIR/audioencoder.kodi.builtin.wma" \
+            "$ADDONS_DIR/game.controller.snes" \
+            "$ADDONS_DIR/metadata.album.universal" \
+            "$ADDONS_DIR/metadata.artists.universal" \
+            "$ADDONS_DIR/metadata.common.allmusic.com" \
+            "$ADDONS_DIR/metadata.common.fanart.tv" \
+            "$ADDONS_DIR/metadata.common.musicbrainz.org" \
+            "$ADDONS_DIR/metadata.common.theaudiodb.com" \
+            "$ADDONS_DIR/metadata.demo.movies" \
+            "$ADDONS_DIR/metadata.demo.tv" \
+            "$ADDONS_DIR/metadata.generic.albums" \
+            "$ADDONS_DIR/metadata.generic.artists" \
+            "$ADDONS_DIR/metadata.themoviedb.org.python" \
+            "$ADDONS_DIR/metadata.tvshows.themoviedb.org.python" \
+            "$ADDONS_DIR/repository.xbmc.org" \
+            "$ADDONS_DIR/resource.images.weathericons.default" \
+            "$ADDONS_DIR/resource.uisounds.kodi" \
+            "$ADDONS_DIR/screensaver.xbmc.builtin.black" \
+            "$ADDONS_DIR/screensaver.xbmc.builtin.dim" \
+            "$ADDONS_DIR/service.xbmc.versioncheck" \
+            "$ADDONS_DIR/webinterface.default"
+          make apk
+          find "$PWD" "$PWD/.." -maxdepth 2 -name "*.apk" -exec ls -lh {} \;
+
+      - name: Upload Kodi Lite .apk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kodi-android-lite-apk
+          path: |
+            kodi/*.apk
+            kodi/build/*.apk
+          retention-days: 30
